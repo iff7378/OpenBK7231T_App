@@ -25,16 +25,35 @@ static const byte LM_STATUS_HDR[4] = { 0x01, 0x11, 0x02, 0x11 };
 
 // OBK channel that receives the decoded door state (0=closed, 1=open).
 static int g_statusChannel = 1;
-// transport sequence nibble for frames we send
-static byte g_txSeq = 0;
+
+// --- ARQ (stop-and-wait) transport state --------------------------------------
+// The Saturn link uses a reliable, sequenced transport. CRITICAL: the operator's
+// data sequence counter is MODULO 8 (verified in the LPC firmware, the TX builder
+// does `seq = (seq+1) & 7`). Sending a seq outside 0..7 leaves its receive window
+// and the operator NAKs, desyncing the link (observed: ~7 good frames then a NAK
+// stall). So our TX seq is mod-8, and we run a real stop-and-wait ARQ: buffer the
+// last data frame, (re)send until the operator ACKs it (`<K{seq}>`), retransmit
+// the SAME frame on NAK (`<N..>`) or timeout, advance the seq only once ACKed.
+#define LM_SEQ_MOD      8       // operator data-seq is 3-bit (mod 8)
+#define LM_TX_MAX_TRIES 6       // retransmit budget per data frame
+#define LM_TX_TMO_TICKS 1       // RunEverySecond ticks before a timeout resend
+static byte g_txSeq = 0;        // next seq to use for a NEW data frame (mod 8)
+
+// the single outstanding (unacknowledged) data frame we own the ARQ for
+static byte g_pendFrame[LM_FRAME_MAX];
+static int  g_pendLen = 0;      // 0 = nothing outstanding
+static byte g_pendSeq = 0;      // seq carried by g_pendFrame
+static int  g_pendTries = 0;    // remaining retransmits
+static int  g_pendTicks = 0;    // RunEverySecond ticks since last (re)send
+
 // stats
 static uint32_t g_rxFrames = 0, g_rxCrcErr = 0, g_txFrames = 0, g_txAcks = 0;
+static uint32_t g_rxAcks = 0, g_rxNaks = 0, g_txResends = 0, g_txDropped = 0;
 
 // last door direction reported by the operator (-1 unknown, 0 closed, 1 open)
 static int g_lastDir = -1;
-// pending door command: target direction we are driving toward (-1 = none)
+// desired door direction (for channel sync / logging); -1 = none
 static int g_doorTarget = -1;
-static int g_doorRetries = 0;
 // guard so our own RX-driven CHANNEL_Set doesn't re-trigger a command
 static int g_suppressChannelCb = 0;
 
@@ -149,25 +168,66 @@ static byte g_doorTlv[16] = {
 };
 static int g_doorLearned = 0; // set once we've captured a real status template
 
+// Build a data frame with the next mod-8 seq, buffer it as the single
+// outstanding ARQ frame, and transmit it. Any previous un-ACKed frame is
+// superseded (door commands coalesce to the latest desired state).
+static void LM_SendData(const byte *hdr, const byte *payload, int plen) {
+	int flen = LM_BuildFrame(hdr, payload, plen, g_txSeq, 'P',
+		g_pendFrame, sizeof(g_pendFrame));
+	if (flen <= 0) return;
+	g_pendLen = flen;
+	g_pendSeq = g_txSeq;
+	g_pendTries = LM_TX_MAX_TRIES;
+	g_pendTicks = 0;
+	g_txSeq = (byte)((g_txSeq + 1) & (LM_SEQ_MOD - 1));
+	LM_SendFrame(g_pendFrame, g_pendLen);
+}
+
+// Resend the outstanding frame verbatim (same seq) on NAK or ack-timeout.
+static void LM_Retransmit(const char *why) {
+	if (g_pendLen <= 0) return;
+	if (g_pendTries-- <= 0) {
+		g_pendLen = 0;
+		g_txDropped++;
+		ADDLOG_INFO(LOG_FEATURE_GENERAL,
+			"LM ARQ gave up on seq %d (%s)", g_pendSeq, why);
+		return;
+	}
+	g_pendTicks = 0;
+	g_txResends++;
+	LM_SendFrame(g_pendFrame, g_pendLen);
+}
+
+// Operator ACKed one of our data frames: '<' 'K' <seqNibble> '>'.
+static void LM_OnAck(char seqChar) {
+	int n = LM_HexNibble(seqChar);
+	g_rxAcks++;
+	if (g_pendLen > 0 && n == (int)g_pendSeq)
+		g_pendLen = 0; // delivered + confirmed
+}
+
+// Operator NAKed: '<' 'N' <raw byte> '>' (its seq field is an internal value,
+// not our nibble) -> retransmit the outstanding frame immediately.
+static void LM_OnNak(void) {
+	g_rxNaks++;
+	LM_Retransmit("nak");
+}
+
 static void LM_SendDoor(int open) {
-	byte frame[LM_FRAME_MAX];
-	int flen;
 	g_doorTlv[15] = open ? 0x01 : 0x00;
-	flen = LM_BuildFrame(LM_DOOR_HDR, g_doorTlv, sizeof(g_doorTlv),
-		g_txSeq++, 'P', frame, sizeof(frame));
-	if (flen > 0) LM_SendFrame(frame, flen);
+	LM_SendData(LM_DOOR_HDR, g_doorTlv, sizeof(g_doorTlv));
 	if (!g_doorLearned)
 		ADDLOG_INFO(LOG_FEATURE_GENERAL,
 			"LM door cmd using FALLBACK template (no status frame learned yet)");
 }
 
-// Drive the door toward a direction, retransmitting (1 Hz) until the operator's
-// reported state confirms it or we run out of retries.
+// Drive the door toward a direction. The ARQ layer reliably delivers the command
+// frame (retransmit on NAK/timeout until the operator ACKs it).
 static void LM_DoorCommand(int open) {
 	g_doorTarget = open ? 1 : 0;
-	g_doorRetries = 8;
 	LM_SendDoor(open);
-	ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM door command -> %s", open ? "OPEN" : "CLOSE");
+	ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM door command -> %s (seq %d)",
+		open ? "OPEN" : "CLOSE", g_pendSeq);
 }
 
 // -------------------------------------------------------------- RX handler ---
@@ -179,8 +239,15 @@ static void LM_HandleInner(char *inner, int innerLen) {
 	char typeChar;
 	int seq;
 
-	if (innerLen < 2 + 2) return; // need TYPE SEQ + at least a byte
+	if (innerLen < 1) return;
 	typeChar = inner[0];
+
+	// ARQ control frames from the operator (short, no body): ACK / NAK of the
+	// data frames WE sent. Handle before the data-frame length guard.
+	if (typeChar == 'K') { if (innerLen >= 2) LM_OnAck(inner[1]); return; }
+	if (typeChar == 'N') { LM_OnNak(); return; }
+
+	if (innerLen < 2 + 2) return; // data frame: need TYPE SEQ + at least a byte
 	seq = LM_HexNibble(inner[1]);
 
 	bodyLen = LM_HexToBytes(inner + 2, body, sizeof(body));
@@ -347,6 +414,19 @@ static commandResult_t CMD_LM_Door(const void *context, const char *cmd,
 	return CMD_RES_OK;
 }
 
+// LM_Stat : log driver + ARQ counters (RX/TX frames, acks/naks, pending, state).
+// Lets us verify link health over HTTP without SWD.
+static commandResult_t CMD_LM_Stat(const void *context, const char *cmd,
+		const char *args, int flags) {
+	ADDLOG_INFO(LOG_FEATURE_GENERAL,
+		"LM rx=%u crcErr=%u tx=%u ack=%u rxAck=%u rxNak=%u resend=%u drop=%u "
+		"pend=%d pendSeq=%d txSeq=%d lastDir=%d target=%d learned=%d",
+		g_rxFrames, g_rxCrcErr, g_txFrames, g_txAcks, g_rxAcks, g_rxNaks,
+		g_txResends, g_txDropped, g_pendLen, g_pendSeq, g_txSeq,
+		g_lastDir, g_doorTarget, g_doorLearned);
+	return CMD_RES_OK;
+}
+
 // Channel callback: when the status channel is set externally (OBK web UI
 // toggle, MQTT, script) drive the door to match. Ignore feedback writes we make
 // ourselves from the RX decode (guarded by g_suppressChannelCb).
@@ -379,6 +459,10 @@ void LiftMaster_Init(void) {
 	//cmddetail:"descr":"Command the door closed(0)/open(1); retransmits until the operator confirms.",
 	//cmddetail:"fn":"CMD_LM_Door","file":"driver/drv_liftmaster.c","requires":""}
 	CMD_RegisterCommand("LM_Door", CMD_LM_Door, NULL);
+	//cmddetail:{"name":"LM_Stat","args":"",
+	//cmddetail:"descr":"Log LiftMaster driver + ARQ counters (rx/tx/ack/nak/pending/state).",
+	//cmddetail:"fn":"CMD_LM_Stat","file":"driver/drv_liftmaster.c","requires":""}
+	CMD_RegisterCommand("LM_Stat", CMD_LM_Stat, NULL);
 
 	ADDLOG_INFO(LOG_FEATURE_GENERAL,
 		"LiftMaster (Saturn/msg1210) driver started @ %d 8N1, status->ch%d",
@@ -386,22 +470,17 @@ void LiftMaster_Init(void) {
 }
 
 void LiftMaster_RunEverySecond(void) {
-	// Retransmit a pending door command (1 Hz) until the operator's reported
-	// state confirms it or retries are exhausted. Cleared in the RX decode.
-	if (g_doorTarget >= 0) {
-		if (g_doorRetries-- > 0) {
-			LM_SendDoor(g_doorTarget);
-		} else {
-			ADDLOG_INFO(LOG_FEATURE_GENERAL,
-				"LM door command gave up (no confirm), target=%d last=%d",
-				g_doorTarget, g_lastDir);
-			g_doorTarget = -1;
-		}
-	}
-	if ((g_rxFrames | g_txFrames) &&
-		(g_rxFrames % 20 == 0)) {
+	// ARQ ack-timeout backstop: NAKs trigger an immediate resend in the RX path;
+	// this catches a silently-dropped frame (no ACK, no NAK) by retransmitting
+	// the outstanding frame until it is ACKed or the retry budget is spent.
+	if (g_pendLen > 0 && ++g_pendTicks >= LM_TX_TMO_TICKS)
+		LM_Retransmit("timeout");
+
+	if ((g_rxFrames | g_txFrames) && (g_rxFrames % 20 == 0)) {
 		ADDLOG_DEBUG(LOG_FEATURE_GENERAL,
-			"LM stats rx=%u crcErr=%u tx=%u ack=%u", g_rxFrames, g_rxCrcErr, g_txFrames, g_txAcks);
+			"LM stats rx=%u crcErr=%u tx=%u ack=%u rxAck=%u rxNak=%u resend=%u drop=%u",
+			g_rxFrames, g_rxCrcErr, g_txFrames, g_txAcks,
+			g_rxAcks, g_rxNaks, g_txResends, g_txDropped);
 	}
 }
 
