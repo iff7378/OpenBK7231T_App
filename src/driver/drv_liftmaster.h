@@ -29,6 +29,7 @@
 void LiftMaster_Init();
 void LiftMaster_RunFrame();        // quick tick: drain UART + parse frames
 void LiftMaster_RunEverySecond();
+void LiftMaster_OnChannelChanged(int channel, int value); // UI/MQTT toggle -> door cmd
 void LiftMaster_Shutdown();
 
 #endif // DRV_LIFTMASTER_H

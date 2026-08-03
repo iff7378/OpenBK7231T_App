@@ -63,7 +63,7 @@ static driver_t g_drivers[] = {
 	NULL,                                    // appendInformationToHTTPIndexPage
 	LiftMaster_RunFrame,                     // runQuickTick
 	LiftMaster_Shutdown,                     // stopFunction
-	NULL,                                    // onChannelChanged
+	LiftMaster_OnChannelChanged,             // onChannelChanged
 	NULL,                                    // onHassDiscovery
 	false,                                   // loaded
 	},

@@ -28,7 +28,15 @@ static int g_statusChannel = 1;
 // transport sequence nibble for frames we send
 static byte g_txSeq = 0;
 // stats
-static uint32_t g_rxFrames = 0, g_rxCrcErr = 0, g_txFrames = 0;
+static uint32_t g_rxFrames = 0, g_rxCrcErr = 0, g_txFrames = 0, g_txAcks = 0;
+
+// last door direction reported by the operator (-1 unknown, 0 closed, 1 open)
+static int g_lastDir = -1;
+// pending door command: target direction we are driving toward (-1 = none)
+static int g_doorTarget = -1;
+static int g_doorRetries = 0;
+// guard so our own RX-driven CHANNEL_Set doesn't re-trigger a command
+static int g_suppressChannelCb = 0;
 
 static byte g_crcTable[256];
 
@@ -113,6 +121,49 @@ static void LM_SendFrame(const byte *frame, int len) {
 	g_txFrames++;
 }
 
+// ARQ ACK: the Saturn link is reliable — the peer runs an ack-timer and
+// retransmits any data frame we don't acknowledge. Reply to each received data
+// frame with '<' 'K' <seqNibble> '>' (the LPC's own FUN_1005318a format) so it
+// stops resending. Without this the operator floods stale retransmits and our
+// door-state feedback lags/inverts.
+static void LM_SendAck(char seqChar) {
+	byte f[4];
+	f[0] = '<'; f[1] = 'K'; f[2] = (byte)seqChar; f[3] = '>';
+	LM_SendFrame(f, 4);
+	g_txAcks++;
+}
+
+// Door command as a myQ TLV (docs/rtl_saturn_protocol.md): the frame payload is
+//   01 <msg_id LE> <attr_id LE> <inner payload...>
+// with the inner payload's last byte = direction (01=open, 00=close). This
+// template is captured from THIS board's status frame; bytes 6..11 are the
+// device serial and are board-specific. hdr 01 11 02 11 routes to the door
+// endpoint. Verified live: injecting this flips the operator's direction latch.
+static const byte LM_DOOR_HDR[4] = { 0x01, 0x11, 0x02, 0x11 };
+static byte g_doorTlv[16] = {
+	0x01, 0x1c, 0x00, 0x20, 0x00, 0x01,
+	0x06, 0x94, 0x50, 0xea, 0x43, 0xf5,
+	0x02, 0x0d, 0x01, 0x00 /* [15] = direction */
+};
+
+static void LM_SendDoor(int open) {
+	byte frame[LM_FRAME_MAX];
+	int flen;
+	g_doorTlv[15] = open ? 0x01 : 0x00;
+	flen = LM_BuildFrame(LM_DOOR_HDR, g_doorTlv, sizeof(g_doorTlv),
+		g_txSeq++, 'P', frame, sizeof(frame));
+	if (flen > 0) LM_SendFrame(frame, flen);
+}
+
+// Drive the door toward a direction, retransmitting (1 Hz) until the operator's
+// reported state confirms it or we run out of retries.
+static void LM_DoorCommand(int open) {
+	g_doorTarget = open ? 1 : 0;
+	g_doorRetries = 8;
+	LM_SendDoor(open);
+	ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM door command -> %s", open ? "OPEN" : "CLOSE");
+}
+
 // -------------------------------------------------------------- RX handler ---
 // inner is the null-terminated text between '<' and '>' : TYPE SEQ hexbody
 static void LM_HandleInner(char *inner, int innerLen) {
@@ -152,6 +203,11 @@ static void LM_HandleInner(char *inner, int innerLen) {
 		return;
 	}
 
+	// ARQ: acknowledge received data frames ('P') so the operator stops
+	// retransmitting them. Do not ACK acks/naks/keepalives.
+	if (typeChar == 'P')
+		LM_SendAck(inner[1]);
+
 	ADDLOG_INFO(LOG_FEATURE_GENERAL,
 		"LM RX type=%c seq=%d hdr=%02X%02X%02X%02X len=%d",
 		typeChar, seq, hdr[0], hdr[1], hdr[2], hdr[3], plen);
@@ -159,7 +215,11 @@ static void LM_HandleInner(char *inner, int innerLen) {
 	// Decode the known door-status frame -> channel.
 	if (plen == LM_STATUS_LEN && memcmp(hdr, LM_STATUS_HDR, 4) == 0) {
 		int dir = payload[plen - 1]; // 0x01=OPEN, 0x00=CLOSED
-		CHANNEL_Set(g_statusChannel, dir ? 1 : 0, 0);
+		g_lastDir = dir ? 1 : 0;
+		if (g_doorTarget == g_lastDir)
+			g_doorTarget = -1; // command confirmed by the operator
+		g_suppressChannelCb = 1; // this is feedback, not a user command
+		CHANNEL_Set(g_statusChannel, g_lastDir, 0);
 		ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM door state = %s (ch%d)",
 			dir ? "OPEN" : "CLOSED", g_statusChannel);
 	}
@@ -264,6 +324,26 @@ static commandResult_t CMD_LM_StatusChannel(const void *context, const char *cmd
 	return CMD_RES_OK;
 }
 
+// LM_Door <0|1> : command the door closed(0)/open(1) with retry-until-confirmed.
+static commandResult_t CMD_LM_Door(const void *context, const char *cmd,
+		const char *args, int flags) {
+	Tokenizer_TokenizeString(args, 0);
+	if (Tokenizer_GetArgsCount() < 1)
+		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
+	LM_DoorCommand(Tokenizer_GetArgInteger(0) ? 1 : 0);
+	return CMD_RES_OK;
+}
+
+// Channel callback: when the status channel is set externally (OBK web UI
+// toggle, MQTT, script) drive the door to match. Ignore feedback writes we make
+// ourselves from the RX decode (guarded by g_suppressChannelCb).
+void LiftMaster_OnChannelChanged(int channel, int value) {
+	if (channel != g_statusChannel) return;
+	if (g_suppressChannelCb) { g_suppressChannelCb = 0; return; }
+	if (value == g_lastDir) return; // already there
+	LM_DoorCommand(value ? 1 : 0);
+}
+
 // ----------------------------------------------------------- lifecycle -------
 void LiftMaster_Init(void) {
 	LM_BuildCrcTable();
@@ -282,6 +362,10 @@ void LiftMaster_Init(void) {
 	//cmddetail:"descr":"Set the OBK channel that receives the decoded door state (0=closed,1=open).",
 	//cmddetail:"fn":"CMD_LM_StatusChannel","file":"driver/drv_liftmaster.c","requires":""}
 	CMD_RegisterCommand("LM_StatusChannel", CMD_LM_StatusChannel, NULL);
+	//cmddetail:{"name":"LM_Door","args":"[0|1]",
+	//cmddetail:"descr":"Command the door closed(0)/open(1); retransmits until the operator confirms.",
+	//cmddetail:"fn":"CMD_LM_Door","file":"driver/drv_liftmaster.c","requires":""}
+	CMD_RegisterCommand("LM_Door", CMD_LM_Door, NULL);
 
 	ADDLOG_INFO(LOG_FEATURE_GENERAL,
 		"LiftMaster (Saturn/msg1210) driver started @ %d 8N1, status->ch%d",
@@ -289,11 +373,22 @@ void LiftMaster_Init(void) {
 }
 
 void LiftMaster_RunEverySecond(void) {
-	// low-rate heartbeat of link stats for now
+	// Retransmit a pending door command (1 Hz) until the operator's reported
+	// state confirms it or retries are exhausted. Cleared in the RX decode.
+	if (g_doorTarget >= 0) {
+		if (g_doorRetries-- > 0) {
+			LM_SendDoor(g_doorTarget);
+		} else {
+			ADDLOG_INFO(LOG_FEATURE_GENERAL,
+				"LM door command gave up (no confirm), target=%d last=%d",
+				g_doorTarget, g_lastDir);
+			g_doorTarget = -1;
+		}
+	}
 	if ((g_rxFrames | g_txFrames) &&
 		(g_rxFrames % 20 == 0)) {
 		ADDLOG_DEBUG(LOG_FEATURE_GENERAL,
-			"LM stats rx=%u crcErr=%u tx=%u", g_rxFrames, g_rxCrcErr, g_txFrames);
+			"LM stats rx=%u crcErr=%u tx=%u ack=%u", g_rxFrames, g_rxCrcErr, g_txFrames, g_txAcks);
 	}
 }
 
