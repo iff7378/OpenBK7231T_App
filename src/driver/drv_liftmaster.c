@@ -59,6 +59,8 @@ static int g_suppressChannelCb = 0;
 
 static byte g_crcTable[256];
 
+static void LM_SetupDoorSwitchUI(void); // web-UI switch on the door-state channel
+
 // ------------------------------------------------------------------ crc ------
 static void LM_BuildCrcTable(void) {
 	int i, b;
@@ -400,6 +402,7 @@ static commandResult_t CMD_LM_StatusChannel(const void *context, const char *cmd
 	if (Tokenizer_GetArgsCount() < 1)
 		return CMD_RES_NOT_ENOUGH_ARGUMENTS;
 	g_statusChannel = Tokenizer_GetArgInteger(0);
+	LM_SetupDoorSwitchUI(); // move the web-UI switch to the new channel
 	ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM status channel = %d", g_statusChannel);
 	return CMD_RES_OK;
 }
@@ -438,10 +441,21 @@ void LiftMaster_OnChannelChanged(int channel, int value) {
 }
 
 // ----------------------------------------------------------- lifecycle -------
+// Present the door-state channel as a clickable ON/OFF switch in the OBK web UI
+// (ON=open, OFF=closed). Clicking it routes CHANNEL_Toggle -> onChannelChanged ->
+// LiftMaster_OnChannelChanged -> door command. Status frames (ours, wall control,
+// or a remote — all event-driven from the LPC) update the channel, so the switch
+// always reflects the real door state regardless of who moved it.
+static void LM_SetupDoorSwitchUI(void) {
+	CHANNEL_SetType(g_statusChannel, ChType_Toggle);
+	CHANNEL_SetLabel(g_statusChannel, "Door", 1 /* hide "Toggle " prefix */);
+}
+
 void LiftMaster_Init(void) {
 	LM_BuildCrcTable();
 	UART_InitUART(LM_BAUD, LM_PARITY, false);
 	UART_InitReceiveRingBuffer(LM_RX_RING);
+	LM_SetupDoorSwitchUI();
 
 	//cmddetail:{"name":"LM_Send","args":"[hdrHex8][payloadHex]",
 	//cmddetail:"descr":"Build a msg1210/Saturn frame (CRC-8 added) and send it to the door board.",
