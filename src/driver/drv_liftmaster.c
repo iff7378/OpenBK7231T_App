@@ -135,16 +135,19 @@ static void LM_SendAck(char seqChar) {
 
 // Door command as a myQ TLV (docs/rtl_saturn_protocol.md): the frame payload is
 //   01 <msg_id LE> <attr_id LE> <inner payload...>
-// with the inner payload's last byte = direction (01=open, 00=close). This
-// template is captured from THIS board's status frame; bytes 6..11 are the
-// device serial and are board-specific. hdr 01 11 02 11 routes to the door
-// endpoint. Verified live: injecting this flips the operator's direction latch.
+// with the inner payload's last byte = direction (01=open, 00=close). We LEARN
+// this whole 16-byte template from the operator's own len-16 status frames
+// (which carry the board-specific device serial), then replay it with the
+// direction byte changed to command the door. The hardcoded values are only a
+// fallback for issuing a command before any status frame has been seen. hdr
+// 01 11 02 11 routes to the door endpoint; verified live to flip the latch.
 static const byte LM_DOOR_HDR[4] = { 0x01, 0x11, 0x02, 0x11 };
 static byte g_doorTlv[16] = {
 	0x01, 0x1c, 0x00, 0x20, 0x00, 0x01,
 	0x06, 0x94, 0x50, 0xea, 0x43, 0xf5,
 	0x02, 0x0d, 0x01, 0x00 /* [15] = direction */
 };
+static int g_doorLearned = 0; // set once we've captured a real status template
 
 static void LM_SendDoor(int open) {
 	byte frame[LM_FRAME_MAX];
@@ -153,6 +156,9 @@ static void LM_SendDoor(int open) {
 	flen = LM_BuildFrame(LM_DOOR_HDR, g_doorTlv, sizeof(g_doorTlv),
 		g_txSeq++, 'P', frame, sizeof(frame));
 	if (flen > 0) LM_SendFrame(frame, flen);
+	if (!g_doorLearned)
+		ADDLOG_INFO(LOG_FEATURE_GENERAL,
+			"LM door cmd using FALLBACK template (no status frame learned yet)");
 }
 
 // Drive the door toward a direction, retransmitting (1 Hz) until the operator's
@@ -215,6 +221,13 @@ static void LM_HandleInner(char *inner, int innerLen) {
 	// Decode the known door-status frame -> channel.
 	if (plen == LM_STATUS_LEN && memcmp(hdr, LM_STATUS_HDR, 4) == 0) {
 		int dir = payload[plen - 1]; // 0x01=OPEN, 0x00=CLOSED
+		// Learn the exact command template (incl. board device serial) from the
+		// operator's own status frame; commands replay it with the dir changed.
+		memcpy(g_doorTlv, payload, sizeof(g_doorTlv));
+		if (!g_doorLearned) {
+			g_doorLearned = 1;
+			ADDLOG_INFO(LOG_FEATURE_GENERAL, "LM learned door command template from status");
+		}
 		g_lastDir = dir ? 1 : 0;
 		if (g_doorTarget == g_lastDir)
 			g_doorTarget = -1; // command confirmed by the operator
